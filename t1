@@ -192,22 +192,46 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(action_frame, text="ACTIONS").pack(pady=10)
 
-        # FIX: all action buttons call threaded wrappers
-        ctk.CTkButton(
+        # Store button refs so we can disable/enable during processing
+        self.btn_reprocess_selected = ctk.CTkButton(
             action_frame, text="Reprocess Selected", command=self._thread_reprocess_selected
-        ).pack(pady=5)
-        ctk.CTkButton(
+        )
+        self.btn_reprocess_selected.pack(pady=5)
+
+        self.btn_reprocess_all = ctk.CTkButton(
             action_frame, text="Reprocess All", command=self._thread_reprocess_all
-        ).pack(pady=5)
-        ctk.CTkButton(action_frame, text="View Data", command=self.view_data).pack()
-        ctk.CTkButton(action_frame, text="Export Excel", command=self.export_excel).pack(pady=5)
+        )
+        self.btn_reprocess_all.pack(pady=5)
+
+        self.btn_view = ctk.CTkButton(action_frame, text="View Data", command=self.view_data)
+        self.btn_view.pack()
+
+        self.btn_export = ctk.CTkButton(action_frame, text="Export Excel", command=self.export_excel)
+        self.btn_export.pack(pady=5)
+
         ctk.CTkButton(
-            action_frame,
-            text="Logout",
-            fg_color="red",
-            hover_color="#cc0000",
+            action_frame, text="Logout",
+            fg_color="red", hover_color="#cc0000",
             command=self.logout,
         ).pack(pady=20)
+
+        # Progress widgets (hidden until a reprocess job starts)
+        self.progress_label = ctk.CTkLabel(
+            action_frame, text="", text_color="#aaaaaa", wraplength=160
+        )
+        self.progress_label.pack(pady=(8, 0))
+        self.progress_label.pack_forget()
+
+        self.progress_bar = ctk.CTkProgressBar(action_frame, width=160)
+        self.progress_bar.set(0)
+        self.progress_bar.pack(pady=(4, 0))
+        self.progress_bar.pack_forget()
+
+        self.progress_count_label = ctk.CTkLabel(
+            action_frame, text="", text_color="#aaaaaa", font=("", 11)
+        )
+        self.progress_count_label.pack(pady=(2, 4))
+        self.progress_count_label.pack_forget()
 
         # ── Sync queue auto-refresh ───────────────────────────────────────────
         def refresh_sync_queue(*_):
@@ -258,9 +282,9 @@ class App(ctk.CTk):
         if not selected_items:
             messagebox.showwarning("Warning", "Select at least one Serial Number.")
             return
-        # Snapshot tree rows AND filter on the main thread
         serials = [self.tree.item(i, "values")[0] for i in selected_items]
         f = self._snapshot_filter()
+        self._set_processing(True, total=len(serials))
         threading.Thread(
             target=self._reprocess_worker, args=(serials, f, False), daemon=True
         ).start()
@@ -271,6 +295,7 @@ class App(ctk.CTk):
             messagebox.showwarning("Warning", "No records to reprocess.")
             return
         f = self._snapshot_filter()
+        self._set_processing(True, total=len(serials))
         threading.Thread(
             target=self._reprocess_worker, args=(serials, f, True), daemon=True
         ).start()
@@ -296,6 +321,44 @@ class App(ctk.CTk):
 
     def _insert_tree_row(self, values: tuple):
         self.after(0, lambda v=values: self.tree.insert("", "end", values=v))
+
+    # ─── Processing state helpers (main thread only via self.after) ──────────
+
+    def _set_processing(self, active: bool, total: int = 0):
+        """
+        MUST run on the main thread (call directly from launchers,
+        or via self.after(0, ...) from background threads).
+
+        active=True  : disable buttons, show + reset progress widgets.
+        active=False : re-enable buttons, mark bar complete, auto-hide after 3 s.
+        """
+        if active:
+            for btn in (self.btn_reprocess_selected, self.btn_reprocess_all,
+                        self.btn_view, self.btn_export):
+                btn.configure(state="disabled")
+            self._total_serials = total          # stored for flush callbacks
+            self.progress_bar.set(0)
+            self.progress_label.configure(text=f"Processing 0 / {total}")
+            self.progress_count_label.configure(text="")
+            # Show widgets (pack_forget was called at init; pack re-adds them)
+            self.progress_label.pack(pady=(8, 0))
+            self.progress_bar.pack(pady=(4, 0))
+            self.progress_count_label.pack(pady=(2, 4))
+        else:
+            for btn in (self.btn_reprocess_selected, self.btn_reprocess_all,
+                        self.btn_view, self.btn_export):
+                btn.configure(state="normal")
+            self.progress_bar.set(1)
+            self.progress_label.configure(text="Done ✓")
+            self.progress_count_label.configure(text="")
+            # Auto-hide after 3 s so the panel doesn't stay cluttered
+            self.after(3000, self._hide_progress)
+
+    def _hide_progress(self):
+        """Remove progress widgets from layout (main thread)."""
+        self.progress_label.pack_forget()
+        self.progress_bar.pack_forget()
+        self.progress_count_label.pack_forget()
 
     # ─── Search ──────────────────────────────────────────────────────────────
 
@@ -340,16 +403,20 @@ class App(ctk.CTk):
 
     # ─── Process single FG (pure worker — no Tkinter reads) ──────────────────
 
-    def _process_fg(self, fgserialnumber: str, f: dict, cursor, session: requests.Session):
+    def _process_fg(self, fgserialnumber: str, f: dict, cursor, session: requests.Session, log_fn=None):
         """
-        Background thread only.  All filter values come from f (plain dict) —
-        no Tkinter widgets are touched here.
+        Background thread only.  All filter values come from f (plain dict).
+
+        log_fn — optional callable(str) for buffered logging from _reprocess_worker.
+                 Falls back to self.log (direct after() call) when called standalone.
         """
+        _log = log_fn if log_fn is not None else self.log
+
         if not fgserialnumber:
-            self.log("Invalid Serial Number — skipping.")
+            _log("Invalid Serial Number — skipping.")
             return
 
-        self.log(f"Processing: {fgserialnumber}")
+        _log(f"Processing: {fgserialnumber}")
 
         try:
             with open(resource_path("sql/AIOT03_BasedOnFG.sql"), "r", encoding="utf-8") as fh:
@@ -362,7 +429,7 @@ class App(ctk.CTk):
             rows = cursor.fetchall()
 
             if not rows:
-                self.log(f"No data found for {fgserialnumber}")
+                _log(f"No data found for {fgserialnumber}")
                 return
 
             success_count = fail_count = 0
@@ -385,27 +452,54 @@ class App(ctk.CTk):
                         resp_json = response.text
 
                     if response.status_code in (200, 201):
-                        success_count += 1
-                        self.log(f"{fgserialnumber} → Success")
-                        self.result_data[fgserialnumber] = {"status": "Success", "response": str(resp_json)}
+                        fail_code = None
+                        if isinstance(resp_json, dict):
+                            fail_code = resp_json.get("FailDictCode", None)
+
+                        if fail_code == "":
+                            success_count += 1
+                            _log(f"{fgserialnumber} → Success (FailDictCode: empty)")
+                            self.result_data[fgserialnumber] = {
+                                "status": "Success",
+                                "response": str(resp_json),
+                                "tag": "success",
+                            }
+                        else:
+                            fail_count += 1
+                            code_display = fail_code if fail_code is not None else "key missing"
+                            _log(f"{fgserialnumber} → Failed (FailDictCode: {code_display})")
+                            self.result_data[fgserialnumber] = {
+                                "status": "Failed",
+                                "response": str(resp_json),
+                                "tag": "failed",
+                            }
                     else:
                         fail_count += 1
-                        self.log(f"{fgserialnumber} → Failed (HTTP {response.status_code})")
+                        _log(f"{fgserialnumber} → Failed (HTTP {response.status_code})")
                         self.result_data[fgserialnumber] = {
                             "status": "Failed",
                             "response": f"HTTP {response.status_code} | {resp_json}",
+                            "tag": "failed",
                         }
                 except Exception as req_err:
                     fail_count += 1
-                    self.log(f"{fgserialnumber} → Request error: {req_err}")
-                    self.result_data[fgserialnumber] = {"status": "Error", "response": str(req_err)}
+                    _log(f"{fgserialnumber} → Request error: {req_err}")
+                    self.result_data[fgserialnumber] = {
+                        "status": "Error",
+                        "response": str(req_err),
+                        "tag": "failed",
+                    }
 
-            self.log(f"{fgserialnumber} done — Success: {success_count}, Failed: {fail_count}")
+            _log(f"{fgserialnumber} done — Success: {success_count}, Failed: {fail_count}")
 
         except Exception as e:
-            self.log(f"Error processing {fgserialnumber}: {e}")
+            _log(f"Error processing {fgserialnumber}: {e}")
 
     # ─── Unified reprocess worker ─────────────────────────────────────────────
+
+    # Flush accumulated log lines to the UI every this many serials.
+    # Keeps the main-thread event queue from being flooded with 1000s of after() calls.
+    _LOG_FLUSH_EVERY = 10
 
     def _reprocess_worker(self, serials: list, f: dict, advance_queue: bool):
         """
@@ -415,33 +509,94 @@ class App(ctk.CTk):
         f              — pre-snapshotted filter dict (no Tkinter reads needed).
         advance_queue  — if True (Reprocess All), auto-advance to the next sync
                          queue once all items are done, then trigger a new search.
+
+        UI update strategy (prevents "Not Responding" on large batches):
+          • Log lines are accumulated in a local list and flushed to the
+            CTkTextbox in a SINGLE self.after() call every LOG_FLUSH_EVERY items.
+          • Progress bar is updated in the same batched after() call.
+          • Buttons are disabled for the duration and re-enabled on completion.
         """
         self._clear_log()
+
+        total        = len(serials)
+        done         = 0
+        processed_any = False
+        log_buffer: list[str] = []
+
+        def _flush(final: bool = False):
+            """
+            Drain log_buffer + update progress bar in ONE self.after() call.
+            Called every _LOG_FLUSH_EVERY serials — never once per serial —
+            so the Tkinter event queue stays shallow even for 1000+ items.
+            """
+            if not log_buffer and not final:
+                return
+            lines = "".join(log_buffer)
+            log_buffer.clear()
+            _done, _total = done, total   # capture current values for the closure
+
+            def _ui_update():
+                if lines:
+                    self.log_text.insert("end", lines)
+                    self.log_text.see("end")
+                fraction = _done / _total if _total else 0
+                self.progress_bar.set(fraction)
+                self.progress_label.configure(
+                    text=f"Processing {_done} / {_total}"
+                )
+                self.progress_count_label.configure(
+                    text=f"{int(fraction * 100)} %"
+                )
+
+            self.after(0, _ui_update)
+
+        def _buf(message: str):
+            """Append a timestamped line to the local buffer (no after() call)."""
+            ts = datetime.now().strftime("%H:%M:%S")
+            log_buffer.append(f"[{ts}] {message}\n")
+
         conn = cursor = session = None
         try:
-            conn = connect_db1()
-            cursor = conn.cursor()
+            conn    = connect_db1()
+            cursor  = conn.cursor()
             session = requests.Session()
 
-            processed_any = False
             for serial in serials:
                 if serial in self.processed:
-                    self.log(f"{serial} already processed — skipping")
-                    continue
-                self.processed.add(serial)
-                processed_any = True
-                self._process_fg(serial, f, cursor, session)
+                    _buf(f"{serial} already processed — skipping")
+                else:
+                    self.processed.add(serial)
+                    processed_any = True
+                    # _process_fg uses _buf-style internal logging passed as callback
+                    self._process_fg(serial, f, cursor, session, log_fn=_buf)
+
+                done += 1
+
+                # Flush every N items so the event queue never accumulates thousands of calls
+                if done % self._LOG_FLUSH_EVERY == 0:
+                    _flush()
+
+            # Final flush for any remaining lines
+            _flush(final=True)
 
             label = "Reprocess All" if advance_queue else "Reprocess Selected"
-            self.log(f"{label} completed." if processed_any else "All items already processed.")
+            completion_msg = f"{label} completed." if processed_any else "All items already processed."
+            self.after(0, lambda m=completion_msg: (
+                self.log_text.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {m}\n"),
+                self.log_text.see("end"),
+            ))
 
-            # ── Auto-advance sync queue ───────────────────────────────────────
+            # Re-enable buttons, hide progress bar
+            self.after(0, lambda: self._set_processing(False))
+
             if advance_queue:
                 self._maybe_advance_sync_queue(f)
 
         except Exception as e:
+            _flush(final=True)
             self.log(f"Error: {e}")
             self._show_error("Error", str(e))
+            self.after(0, lambda: self._set_processing(False))
         finally:
             if session: session.close()
             if cursor:  cursor.close()
@@ -535,6 +690,13 @@ class App(ctk.CTk):
             tree.column(col, anchor="center", width=150)
         tree.pack(fill="both", expand=True, padx=10, pady=10)
 
+        # Row colour tags: green = FailDictCode "", red = anything else
+        style = ttk.Style(view_win)
+        style.theme_use("default")
+        tree.tag_configure("success", background="#1a7a3a", foreground="white")
+        tree.tag_configure("failed",  background="#8b1a1a", foreground="white")
+        tree.tag_configure("pending", background="#2b2b2b", foreground="#aaaaaa")
+
         # Snapshot tree rows on the main thread
         rows_snapshot = [
             self.tree.item(i, "values") for i in self.tree.get_children()
@@ -548,13 +710,14 @@ class App(ctk.CTk):
             for values in rows_snapshot:
                 serial, fail_dt, reason = values[0], values[1], values[2]
                 order_no = self._get_order_number(cursor, serial, f)
-                result = self.result_data.get(serial, {})
+                result   = self.result_data.get(serial, {})
+                tag      = result.get("tag", "pending")
                 tree.insert("", "end", values=(
                     order_no,
                     result.get("status", "Not Processed"),
                     serial, fail_dt, reason,
                     result.get("response", ""),
-                ))
+                ), tags=(tag,))
         except Exception as e:
             messagebox.showerror("Error", str(e))
         finally:
