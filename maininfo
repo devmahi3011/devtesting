@@ -1,0 +1,856 @@
+# Automated Reprocess Manager (ARM) — Technical Documentation
+
+**Version:** 1.0  
+**Language:** Python 3.10+  
+**Framework:** CustomTkinter (GUI), pyodbc (DB), requests (HTTP)  
+**Last Updated:** 2026
+
+---
+
+## Table of Contents
+
+1. [Project Overview](#1-project-overview)
+2. [Project Structure](#2-project-structure)
+3. [Architecture Overview](#3-architecture-overview)
+4. [Threading Model](#4-threading-model)
+5. [Environment & Configuration](#5-environment--configuration)
+6. [Module Reference](#6-module-reference)
+   - 6.1 [Module-level functions](#61-module-level-functions)
+   - 6.2 [Class: `DateTimePicker`](#62-class-datetimepicker)
+   - 6.3 [Class: `App`](#63-class-app)
+     - 6.3.1 [Instance attributes](#631-instance-attributes)
+     - 6.3.2 [UI construction](#632-ui-construction)
+     - 6.3.3 [Filter snapshot pattern](#633-filter-snapshot-pattern)
+     - 6.3.4 [Thread launchers](#634-thread-launchers)
+     - 6.3.5 [Thread-safe UI helpers](#635-thread-safe-ui-helpers)
+     - 6.3.6 [Search](#636-search)
+     - 6.3.7 [Reprocess worker](#637-reprocess-worker)
+     - 6.3.8 [Process single FG](#638-process-single-fg)
+     - 6.3.9 [Auto-advance sync queue](#639-auto-advance-sync-queue)
+     - 6.3.10 [Order number helper](#6310-order-number-helper)
+     - 6.3.11 [View Data](#6311-view-data)
+     - 6.3.12 [Export Excel](#6312-export-excel)
+     - 6.3.13 [Logout](#6313-logout)
+7. [SQL Files Reference](#7-sql-files-reference)
+8. [Web Service API Contract](#8-web-service-api-contract)
+9. [Data Flow Diagrams](#9-data-flow-diagrams)
+10. [State Management](#10-state-management)
+11. [Error Handling Strategy](#11-error-handling-strategy)
+12. [Key Design Decisions](#12-key-design-decisions)
+13. [Dependency Reference](#13-dependency-reference)
+14. [Packaging with PyInstaller](#14-packaging-with-pyinstaller)
+15. [Known Limitations & Future Improvements](#15-known-limitations--future-improvements)
+
+---
+
+## 1. Project Overview
+
+ARM is a single-file Python desktop application (`arm_app.py`) that provides an operator interface for identifying and replaying failed manufacturing synchronization messages. It integrates three external systems:
+
+- **SQL Server database** — source of failure records, pool/queue metadata, and order references
+- **Web service endpoint** — accepts message payloads and reprocesses them
+- **Excel output** — operator-facing export of results
+
+The application is built on the **CustomTkinter** GUI framework (dark mode, blue theme) and uses **Python's `threading` module** to keep the UI responsive during all I/O operations.
+
+---
+
+## 2. Project Structure
+
+```
+arm/
+├── arm_app.py              # Main application (single file — all logic here)
+├── login.py                # Login screen (imported dynamically on logout)
+├── .env                    # Environment config (not committed to source control)
+├── sql/
+│   ├── PROD_SQ.sql         # Sync queue list query
+│   ├── FailedFG.sql        # Failed FG serial number query
+│   ├── AIOT03_BasedOnFG.sql# Message payload query per FG serial
+│   └── FetchOrderBaseOnFG.sql # Order number lookup query
+└── ARM.exe                 # (packaged output — PyInstaller)
+```
+
+> `login.py` is imported lazily inside `App.logout()` to avoid a circular import at startup. It must expose a `LoginApp` class with a `mainloop()` method.
+
+---
+
+## 3. Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        arm_app.py                           │
+│                                                             │
+│  ┌──────────────┐    ┌──────────────────────────────────┐  │
+│  │ DateTimePicker│    │             App                  │  │
+│  │  (CTkFrame)  │    │          (ctk.CTk)                │  │
+│  │              │    │                                   │  │
+│  │ .date        │    │  Filter frame  │  Table + Logs   │  │
+│  │ .hour        │    │  (pool, queue, │  (ttk.Treeview, │  │
+│  │ .minute      │    │   date/time)   │   CTkTextbox)   │  │
+│  │ .second      │    │                │                 │  │
+│  │              │    │  Actions panel (buttons)          │  │
+│  └──────────────┘    └──────────────────────────────────┘  │
+│                                  │                          │
+│              ┌───────────────────┼──────────────────────┐  │
+│              ▼                   ▼                       ▼  │
+│       Main Thread          Background Threads            │  │
+│    (UI events only)    (_search, _reprocess_worker,      │  │
+│                         _process_fg, _maybe_advance)     │  │
+└─────────────────────────────────────────────────────────────┘
+         │                        │
+         ▼                        ▼
+   SQL Server DB           Web Service (HTTP POST)
+   (pyodbc)                (requests.Session)
+```
+
+**Key architectural principle:** The main thread handles only UI events. All database queries and HTTP calls run in daemon background threads. Results are marshalled back to the main thread exclusively via `self.after(0, callback)`.
+
+---
+
+## 4. Threading Model
+
+### Rule: Zero Tkinter widget access from background threads
+
+Tkinter is not thread-safe. Any widget read or write from a non-main thread is undefined behaviour and causes random freezes or crashes.
+
+ARM enforces this with the **filter snapshot pattern**:
+
+```
+Button click (main thread)
+    │
+    ├─ Read all widget values NOW  ─→  f = _snapshot_filter()  [dict of plain Python values]
+    ├─ Read tree rows NOW          ─→  serials = [...]
+    │
+    └─ threading.Thread(target=worker, args=(serials, f)).start()
+                │
+                │  Background thread — touches NO Tkinter widgets
+                ├─ DB queries using f["pool"], f["from_dt"], etc.
+                ├─ HTTP calls
+                ├─ self.log(...)          ─→  self.after(0, lambda: ...) back to main
+                └─ self._insert_tree_row(...)  ─→  self.after(0, lambda: ...)
+```
+
+### Thread lifecycle
+
+| Thread | Trigger | Joins? |
+|---|---|---|
+| `_search` | Search button | No (daemon) |
+| `_reprocess_worker` | Reprocess Selected / Reprocess All buttons | No (daemon) |
+| Auto-advance search | `_advance_on_main()` via `self.after()` | No (daemon) |
+
+All threads are `daemon=True` — they are killed automatically when the main window closes without needing explicit join/cleanup.
+
+### Concurrency risk: `self.processed` and `self.result_data`
+
+These two dict/set are written by background threads and read on the main thread (in `view_data` and `export_excel`). In CPython, GIL-protected dict/set operations are atomic for simple get/set/add, so no explicit lock is currently used. If porting to a non-CPython runtime, wrap accesses in a `threading.Lock`.
+
+---
+
+## 5. Environment & Configuration
+
+ARM uses `python-dotenv` to load a `.env` file at startup. `load_env()` resolves the path relative to `sys._MEIPASS` (PyInstaller bundle) or the working directory.
+
+### `.env` keys
+
+| Key | Required | Example | Description |
+|---|---|---|---|
+| `WEB_SERVICES` | ✅ | `https://host/api/run` | Web service endpoint URL |
+| `DB2_DRIVER` | ✅ | `ODBC Driver 17 for SQL Server` | ODBC driver name |
+| `DB2_SERVER` | ✅ | `sqlserver01` | Database server hostname or IP |
+| `DB2_DATABASE` | ✅ | `ProductionDB` | Database name |
+| `DB2_TRUSTED` | ✅ | `yes` | Windows integrated auth (`yes`/`no`) |
+
+`WEB_SERVICES` is validated immediately after loading. If absent, the application raises `ValueError` and exits before any window is shown.
+
+### `resource_path(relative_path)`
+
+```python
+def resource_path(relative_path):
+    base_path = getattr(sys, "_MEIPASS", None) or os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+```
+
+Used for all file reads (SQL files). `sys._MEIPASS` is the temp directory PyInstaller extracts bundled files to at runtime, ensuring SQL files are found whether running from source or as a compiled `.exe`.
+
+---
+
+## 6. Module Reference
+
+### 6.1 Module-level functions
+
+#### `load_env() → None`
+
+Resolves the `.env` path (PyInstaller-aware) and loads it into `os.environ` via `python-dotenv`.
+
+---
+
+#### `connect_db1() → pyodbc.Connection`
+
+Opens and returns a new `pyodbc` connection using the four `DB2_*` environment variables. Every caller is responsible for closing the connection. No connection pooling is used — each operation opens its own connection.
+
+```python
+def connect_db1() -> pyodbc.Connection:
+    return pyodbc.connect(
+        f"DRIVER={{{os.getenv('DB2_DRIVER')}}};"
+        f"SERVER={os.getenv('DB2_SERVER')};"
+        f"DATABASE={os.getenv('DB2_DATABASE')};"
+        f"Trusted_Connection={os.getenv('DB2_TRUSTED')};"
+    )
+```
+
+**Raises:** `pyodbc.Error` on connection failure — callers handle via `try/except`.
+
+---
+
+#### `fetch_pool_list() → list[str]`
+
+Queries `JOB_POOL` for all pools whose `Name` contains `MI`. Returns a list of name strings. Called once at startup to populate the Pool dropdown. Returns `[]` on error (silently logs to stdout).
+
+```sql
+SELECT Name FROM JOB_POOL WHERE Name LIKE '%MI%'
+```
+
+---
+
+#### `fetch_sync_queue_list(pool, from_dt, to_dt) → list[str]`
+
+Executes `sql/PROD_SQ.sql` with three parameters and returns a list of sync queue name strings. Returns `["No Data Found"]` if the query returns no rows, or `["Error Loading"]` on exception.
+
+Called:
+- From `refresh_sync_queue()` on the main thread whenever Pool or date changes
+- From `_maybe_advance_sync_queue()` on a background thread (uses plain datetime values, not widgets)
+
+---
+
+### 6.2 Class: `DateTimePicker`
+
+**Inherits:** `ctk.CTkFrame`
+
+A reusable composite widget that combines a `tkcalendar.DateEntry` calendar picker with three `CTkComboBox` dropdowns (hour, minute, second) and a static `(CET)` label.
+
+#### Constructor
+
+```python
+DateTimePicker(master, label, default_time=("00", "00", "00"))
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `master` | `ctk.CTkFrame` | Parent widget |
+| `label` | `str` | Label text displayed to the left (e.g. `"From Date"`) |
+| `default_time` | `tuple[str, str, str]` | Default values for hour, minute, second dropdowns |
+
+#### Attributes
+
+| Attribute | Type | Description |
+|---|---|---|
+| `self.date` | `DateEntry` | Calendar date picker (`yyyy-mm-dd` format) |
+| `self.hour` | `CTkComboBox` | Hour selector (values `"00"` – `"23"`) |
+| `self.minute` | `CTkComboBox` | Minute selector (values `"00"` – `"59"`) |
+| `self.second` | `CTkComboBox` | Second selector (values `"00"` – `"59"`) |
+
+#### Method: `get_cet_datetime() → datetime | None`
+
+Reads the four widget values, parses them into a naive `datetime`, then attaches the `Europe/Berlin` timezone using `pytz.localize(dt, is_dst=False)`.
+
+`is_dst=False` is intentional — during the clock-back DST transition (when clocks go from 03:00 back to 02:00, making times between 02:00–03:00 ambiguous), this always picks the post-DST standard time interpretation instead of raising `pytz.exceptions.AmbiguousTimeError`.
+
+Returns `None` on any parse error (also prints to stdout).
+
+---
+
+### 6.3 Class: `App`
+
+**Inherits:** `ctk.CTk`  
+**Window size:** `1100 × 650`
+
+The main application window. Owns all UI widgets, state, and business logic.
+
+---
+
+#### 6.3.1 Instance attributes
+
+| Attribute | Type | Description |
+|---|---|---|
+| `self.processed` | `set[str]` | Serial numbers already submitted in this session. Prevents duplicate API calls across multiple Reprocess clicks. Cleared by Search and by auto-advance. |
+| `self.result_data` | `dict[str, dict]` | Maps each serial number to its last `{"status": str, "response": str}` result dict. Written by `_process_fg`, read by `view_data` and `export_excel`. |
+| `self.from_dt` | `DateTimePicker` | Start of filter date/time range |
+| `self.to_dt` | `DateTimePicker` | End of filter date/time range |
+| `self.pool_var` | `ctk.StringVar` | Tracks selected Pool value |
+| `self.pool` | `CTkComboBox` | Pool dropdown widget |
+| `self.sync_var` | `ctk.StringVar` | Tracks selected Sync Queue value |
+| `self.sync` | `CTkComboBox` | Sync Queue dropdown widget |
+| `self.tree` | `ttk.Treeview` | Failed FGSN table (3 columns: Serial Number, Fail Date/Time, Reason) |
+| `self.log_text` | `CTkTextbox` | Scrollable log output panel |
+
+---
+
+#### 6.3.2 UI construction
+
+`__init__` builds the entire UI synchronously on the main thread in this order:
+
+1. **Filter frame** — two `DateTimePicker` widgets (grid rows 0–1, col 0), Pool ComboBox (row 0, col 2), Sync Queue ComboBox (row 1, col 2), Search button (col 3)
+2. **Main frame** — left: table frame with `ttk.Treeview` + log frame; right: action frame with 5 buttons
+3. **Sync queue auto-refresh** — wires callbacks so the Sync Queue dropdown refreshes whenever Pool, date, hour, minute, or second changes
+
+**Sync queue refresh bindings:**
+
+```python
+self.pool_var.trace_add("write", refresh_sync_queue)        # Pool change
+self.from_dt.date.bind("<<DateEntrySelected>>", ...)        # From date calendar
+self.to_dt.date.bind("<<DateEntrySelected>>", ...)          # To date calendar
+picker.hour.configure(command=lambda _v: refresh_sync_queue())    # Hour dropdowns
+picker.minute.configure(command=lambda _v: refresh_sync_queue())  # Minute dropdowns
+picker.second.configure(command=lambda _v: refresh_sync_queue())  # Second dropdowns
+```
+
+---
+
+#### 6.3.3 Filter snapshot pattern
+
+```python
+def _snapshot_filter(self) -> dict:
+```
+
+Reads all five filter values from Tkinter widgets and returns them as a plain Python `dict`. Must always be called on the **main thread**. The returned dict is then passed as argument `f` to all background threads — zero widget reads happen inside threads.
+
+**Return value:**
+
+```python
+{
+    "pool":       str,       # e.g. "MI_POOL_01"
+    "sync_queue": str,       # e.g. "SYNC_Q_A"
+    "sync_pat":   str,       # e.g. "%SYNC_Q_A%" (LIKE pattern)
+    "from_dt":    datetime,  # CET-aware datetime (or None)
+    "to_dt":      datetime,  # CET-aware datetime (or None)
+}
+```
+
+---
+
+#### 6.3.4 Thread launchers
+
+All three launchers run on the main thread. They snapshot state first, then hand it off to a daemon thread.
+
+##### `_thread_search()`
+
+```python
+f = self._snapshot_filter()
+threading.Thread(target=self._search, args=(f,), daemon=True).start()
+```
+
+##### `_thread_reprocess_selected()`
+
+Reads `self.tree.selection()` (main thread only), maps to serial numbers, snapshots filter, then starts `_reprocess_worker` with `advance_queue=False`.
+
+##### `_thread_reprocess_all()`
+
+Reads `self.tree.get_children()` (main thread only), maps to serial numbers, snapshots filter, then starts `_reprocess_worker` with `advance_queue=True`.
+
+Both reprocess launchers guard against empty inputs with `messagebox.showwarning` before starting the thread.
+
+---
+
+#### 6.3.5 Thread-safe UI helpers
+
+All methods below schedule work on the main thread via `self.after(0, callback)` and are safe to call from any thread.
+
+| Method | Signature | Description |
+|---|---|---|
+| `log` | `(message: str) → None` | Appends `[HH:MM:SS] message\n` to `self.log_text` and scrolls to end |
+| `_show_error` | `(title, msg) → None` | Shows `messagebox.showerror` on the main thread |
+| `_show_warning` | `(title, msg) → None` | Shows `messagebox.showwarning` on the main thread |
+| `_clear_log` | `() → None` | Deletes all content from `self.log_text` |
+| `_clear_tree` | `() → None` | Removes all rows from `self.tree` |
+| `_insert_tree_row` | `(values: tuple) → None` | Inserts one row into `self.tree` using a default-argument lambda to capture the value correctly |
+
+> **Lambda capture note:** `_insert_tree_row` uses `lambda v=values: ...` (not `lambda: ...`) to capture the current value of `values` at the time of scheduling, preventing the classic Python late-binding closure bug.
+
+---
+
+#### 6.3.6 Search
+
+```python
+def _search(self, f: dict) → None
+```
+
+**Thread:** Background daemon  
+**SQL file:** `sql/FailedFG.sql`  
+**Parameters:** `(f["pool"], f["sync_pat"], f["from_dt"], f["to_dt"])`
+
+1. Clears log and tree
+2. Opens a new DB connection and cursor
+3. Executes `FailedFG.sql` with the four filter parameters
+4. For each row, extracts `fgserialnumber` (col 0), `FinishedOn` (col 1), `Info` (col 2) using both attribute-name and positional fallback access
+5. Formats datetime to `"%Y-%m-%d %H:%M:%S"` string
+6. Calls `_insert_tree_row()` for each row (schedules to main thread)
+7. Logs the count on completion
+
+Attribute-name access (`row.fgserialnumber`) is attempted first to support both pyodbc `Row` objects and named-tuple-like results; falls back to index access for robustness.
+
+---
+
+#### 6.3.7 Reprocess worker
+
+```python
+def _reprocess_worker(self, serials: list, f: dict, advance_queue: bool) → None
+```
+
+**Thread:** Background daemon
+
+Opens a single shared DB connection and `requests.Session` for all serials in the batch. For each serial number:
+
+- Skips if already in `self.processed` (logs skip)
+- Adds to `self.processed`
+- Calls `_process_fg(serial, f, cursor, session)`
+
+After all serials finish:
+
+- Logs completion
+- If `advance_queue=True`, calls `_maybe_advance_sync_queue(f)`
+
+Resources are released in `finally` regardless of errors. Exceptions are caught, logged, and shown as an error dialog.
+
+---
+
+#### 6.3.8 Process single FG
+
+```python
+def _process_fg(self, fgserialnumber: str, f: dict, cursor, session: requests.Session) → None
+```
+
+**Thread:** Background daemon (called from `_reprocess_worker`)  
+**SQL file:** `sql/AIOT03_BasedOnFG.sql`  
+**Parameters:** `(f["pool"], f["sync_pat"], f["from_dt"], f["to_dt"], fgserialnumber)`
+
+For each message row returned by the SQL query, builds and POSTs this payload:
+
+```json
+{
+  "Inputs": {
+    "IncomingMessage": "<raw message string from DB>"
+  },
+  "ExecutionMode": 1,
+  "Retries": 1,
+  "SleepTime": 100,
+  "SynchronousQueue": "",
+  "Timeout": 100
+}
+```
+
+HTTP call details:
+
+| Setting | Value |
+|---|---|
+| Method | `POST` |
+| URL | `AIOT03_DEV` (from `WEB_SERVICES` env var) |
+| SSL verification | Disabled (`verify=False`) |
+| Timeout | 30 seconds |
+| Success codes | `200`, `201` |
+
+Results are stored in `self.result_data[fgserialnumber]` as:
+
+```python
+{
+    "status":   "Success" | "Failed" | "Error",
+    "response": str   # JSON-decoded response or raw text or error message
+}
+```
+
+Per-serial success/fail counts are logged on completion.
+
+---
+
+#### 6.3.9 Auto-advance sync queue
+
+```python
+def _maybe_advance_sync_queue(self, f: dict) → None
+```
+
+**Thread:** Background daemon  
+**Called by:** `_reprocess_worker` when `advance_queue=True`
+
+Algorithm:
+
+```
+1. Call fetch_sync_queue_list(f["pool"], f["from_dt"], f["to_dt"])
+2. Filter out placeholder values ("No Data Found", "Error Loading", etc.)
+3. Find index of f["sync_queue"] in valid list
+   - Not found → log warning, return
+4. If idx + 1 >= len(valid) → log "All queues processed", return
+5. next_q = valid[idx + 1]
+6. Build next_f = {**f, "sync_queue": next_q, "sync_pat": "%next_q%"}
+7. self.after(0, _advance_on_main)
+   - _advance_on_main() (runs on main thread):
+       self.sync.configure(values=valid)   ← only Tkinter writes here
+       self.sync_var.set(next_q)           ← only Tkinter writes here
+       self.processed.clear()
+       threading.Thread(target=self._search, args=(next_f,)).start()
+```
+
+All widget writes happen inside `_advance_on_main` which is scheduled on the main thread via `self.after(0, ...)`. The background thread itself never touches any widget.
+
+---
+
+#### 6.3.10 Order number helper
+
+```python
+def _get_order_number(self, cursor, serial: str, f: dict) → str
+```
+
+**SQL file:** `sql/FetchOrderBaseOnFG.sql`  
+**Parameters:** `(f["pool"], f["sync_pat"], f["from_dt"], f["to_dt"], serial)`
+
+Executes the order lookup query and returns `row[0]` (order number string), or `""` if no row is found or an error occurs. Called from `view_data` and `export_excel` on the main thread using a pre-opened cursor.
+
+---
+
+#### 6.3.11 View Data
+
+```python
+def view_data(self) → None
+```
+
+**Thread:** Main thread
+
+1. Calls `_snapshot_filter()` — captures current filter values
+2. Snapshots all tree rows into `rows_snapshot` list — captures table state before opening the dialog
+3. Opens a `CTkToplevel` window (1000×450)
+4. Opens a DB connection and iterates `rows_snapshot`:
+   - Calls `_get_order_number()` for each serial
+   - Looks up `self.result_data.get(serial, {})` for status/response
+   - Inserts into the view window's `Treeview`
+
+The row snapshot ensures the view reflects the table state at the moment the button was clicked, even if a background search were running simultaneously.
+
+---
+
+#### 6.3.12 Export Excel
+
+```python
+def export_excel(self) → None
+```
+
+**Thread:** Main thread
+
+1. Opens a `filedialog.asksaveasfilename` dialog
+2. Snapshots filter and tree rows (same pattern as `view_data`)
+3. Opens a DB connection and builds a list of dicts with: Order Number, Status, Serial Number, Fail Date, Reason, Response
+4. Converts to `pandas.DataFrame` and writes to `.xlsx` via `df.to_excel(file, index=False)`
+
+---
+
+#### 6.3.13 Logout
+
+```python
+def logout(self) → None
+```
+
+Destroys the current window, then lazily imports `LoginApp` from `login.py` and starts its event loop. The lazy import avoids a circular dependency since `login.py` presumably imports `App`.
+
+---
+
+## 7. SQL Files Reference
+
+### `sql/PROD_SQ.sql`
+
+**Purpose:** Returns the list of Synchronization Queue names available for a given pool within a date range.  
+**Parameters:** `(pool_name, from_datetime, to_datetime)`  
+**Returns:** Single column of queue name strings.
+
+---
+
+### `sql/FailedFG.sql`
+
+**Purpose:** Returns all failed FG serial numbers matching the selected pool, sync queue pattern, and date range.  
+**Parameters:** `(pool_name, sync_queue_pattern, from_datetime, to_datetime)`
+
+**Expected result columns:**
+
+| Index | Name | Type | Description |
+|---|---|---|---|
+| 0 | `fgserialnumber` | `str` | FG serial number |
+| 1 | `FinishedOn` | `datetime` | Timestamp of failure |
+| 2 | `Info` | `str` | Failure reason / error message |
+
+---
+
+### `sql/AIOT03_BasedOnFG.sql`
+
+**Purpose:** Returns the raw message payloads to be replayed for a specific FG serial number.  
+**Parameters:** `(pool_name, sync_queue_pattern, from_datetime, to_datetime, fgserialnumber)`
+
+**Expected result columns:**
+
+| Index | Name | Type | Description |
+|---|---|---|---|
+| 0 | *(unnamed)* | `str` | Raw message string to send as `IncomingMessage` in the API payload |
+
+Multiple rows per serial number are possible — each row results in a separate API call.
+
+---
+
+### `sql/FetchOrderBaseOnFG.sql`
+
+**Purpose:** Returns the Order Number associated with a given FG serial number.  
+**Parameters:** `(pool_name, sync_queue_pattern, from_datetime, to_datetime, fgserialnumber)`
+
+**Expected result columns:**
+
+| Index | Name | Type | Description |
+|---|---|---|---|
+| 0 | *(unnamed)* | `str` | Order number string |
+
+Returns at most one row. If no row is found, the order number is shown as an empty string.
+
+---
+
+## 8. Web Service API Contract
+
+### Request
+
+```
+POST  {WEB_SERVICES}
+Content-Type: application/json
+SSL verification: disabled
+Timeout: 30 seconds
+```
+
+**Payload schema:**
+
+```json
+{
+  "Inputs": {
+    "IncomingMessage": "<string — raw message from DB>"
+  },
+  "ExecutionMode": 1,
+  "Retries": 1,
+  "SleepTime": 100,
+  "SynchronousQueue": "",
+  "Timeout": 100
+}
+```
+
+| Field | Type | Value | Description |
+|---|---|---|---|
+| `Inputs.IncomingMessage` | `string` | From DB (col 0 of `AIOT03_BasedOnFG.sql`) | The original message payload to reprocess |
+| `ExecutionMode` | `int` | `1` | Synchronous execution mode |
+| `Retries` | `int` | `1` | Number of retries the service should attempt |
+| `SleepTime` | `int` | `100` | Milliseconds between retries |
+| `SynchronousQueue` | `string` | `""` | Empty — not routing to a named queue |
+| `Timeout` | `int` | `100` | Service-side processing timeout (ms) |
+
+### Response
+
+| HTTP Status | ARM Interpretation | Stored status |
+|---|---|---|
+| `200` or `201` | Success | `"Success"` |
+| Any other | Failure | `"Failed"` |
+| Request exception | Network/timeout error | `"Error"` |
+
+The raw response body (JSON-decoded if possible, otherwise raw text) is stored in `self.result_data[serial]["response"]` for display in View Data and Export Excel.
+
+---
+
+## 9. Data Flow Diagrams
+
+### Search Flow
+
+```
+[Search button click]  ← main thread
+        │
+        ├─ _snapshot_filter() → f
+        └─ Thread(_search, f) ─────────────────────────────────┐
+                                                               │ background thread
+                                                               ▼
+                                                    connect_db1()
+                                                    cursor.execute(FailedFG.sql, ...)
+                                                    rows = cursor.fetchall()
+                                                         │
+                                              for each row:
+                                                    self.after(0, _insert_tree_row)
+                                                         │
+                                                         ▼
+                                              [main thread inserts row into tree]
+```
+
+---
+
+### Reprocess All Flow
+
+```
+[Reprocess All click]  ← main thread
+        │
+        ├─ serials = snapshot tree rows
+        ├─ f = _snapshot_filter()
+        └─ Thread(_reprocess_worker, serials, f, advance_queue=True)
+                    │                                          background thread
+                    │
+            for each serial:
+                ├─ skip if in self.processed
+                └─ _process_fg(serial, f, cursor, session)
+                        │
+                        ├─ cursor.execute(AIOT03_BasedOnFG.sql, ...)
+                        └─ for each message row:
+                                session.post(WEB_SERVICES, payload)
+                                self.result_data[serial] = {status, response}
+                                self.after(0, log_message)
+                    │
+            _maybe_advance_sync_queue(f)
+                    │
+                    ├─ fetch_sync_queue_list(...)
+                    ├─ find next queue
+                    └─ self.after(0, _advance_on_main)
+                                │               main thread
+                                ├─ sync.configure(values=...)
+                                ├─ sync_var.set(next_q)
+                                ├─ processed.clear()
+                                └─ Thread(_search, next_f).start()
+```
+
+---
+
+## 10. State Management
+
+ARM maintains two mutable state objects that cross the main/background thread boundary:
+
+### `self.processed` — `set[str]`
+
+| Operation | Where | When |
+|---|---|---|
+| `.clear()` | Main thread | On Search start; on auto-advance |
+| `.add(serial)` | Background thread | Before each `_process_fg` call |
+| `in self.processed` | Background thread | Deduplication check |
+
+**Thread safety:** CPython `set.add` and `in` are GIL-protected. Safe without a lock in CPython.
+
+### `self.result_data` — `dict[str, dict]`
+
+| Operation | Where | When |
+|---|---|---|
+| `[serial] = {...}` | Background thread | After each API call in `_process_fg` |
+| `.get(serial, {})` | Main thread | In `view_data` and `export_excel` |
+
+**Thread safety:** CPython dict assignment and read are GIL-protected. Safe without a lock in CPython.
+
+---
+
+## 11. Error Handling Strategy
+
+ARM uses a layered error handling strategy:
+
+| Layer | Mechanism | Behaviour |
+|---|---|---|
+| Startup | `raise ValueError` | Hard fail — application won't start without `.env` |
+| DB connection | `try/except` in every function | Logs error, shows dialog, returns empty result |
+| SQL file not found | `try/except` around `open()` | Logs error, function returns early |
+| API call exception | `try/except requests.Exception` | Logs as `Request error`, stores `"Error"` status, continues |
+| API non-200 | Status code check | Logs as `Failed (HTTP NNN)`, stores `"Failed"` status, continues |
+| Background thread unhandled | Outer `try/except` in each worker | Logs error, shows error dialog, releases resources in `finally` |
+| UI helper calls from thread | Always via `self.after(0, ...)` | Guaranteed to run on main thread, no race condition |
+
+All `finally` blocks guarantee that DB connections and requests sessions are closed even when exceptions occur mid-processing.
+
+---
+
+## 12. Key Design Decisions
+
+### Why snapshot filter values before threading?
+
+Tkinter `StringVar.get()` and widget attribute reads are not thread-safe. Even read-only access from a background thread can cause `RuntimeError` or silently return garbage values. The `_snapshot_filter()` pattern eliminates this entirely — background threads work only with plain Python dicts.
+
+### Why one DB connection per worker thread, not a shared pool?
+
+`pyodbc` connections are not thread-safe for concurrent use. Each background thread creates its own connection and closes it in `finally`. This is safe, simple, and avoids connection state corruption. The trade-off (a new connection per operation) is acceptable given the non-concurrent, sequential nature of the operations.
+
+### Why `is_dst=False` in `get_cet_datetime()`?
+
+`pytz.localize()` raises `pytz.exceptions.AmbiguousTimeError` for wall-clock times that occur twice during a DST clock-back transition (e.g. 02:30 on the day clocks go back). Using `is_dst=False` makes the choice deterministic (always post-DST standard time) and never crashes.
+
+### Why `advance_queue` only for Reprocess All, not Reprocess Selected?
+
+Auto-advance semantics are: "all items in this queue have been handled, move to the next." Reprocess Selected only handles a subset of items, so it cannot know whether the queue is truly exhausted. Only Reprocess All processes every visible item and can safely trigger the advance.
+
+### Why lazy import of `login.py` in `logout()`?
+
+`login.py` imports `App` from `arm_app.py`. If `arm_app.py` also imported `login` at the top level, Python would hit a circular import. The lazy `from login import LoginApp` inside `logout()` defers the import until it's actually needed, when `App` is already fully defined in Python's module cache.
+
+---
+
+## 13. Dependency Reference
+
+| Package | Version constraint | Purpose |
+|---|---|---|
+| `customtkinter` | `>=5.0` | Modern dark-mode Tkinter widget framework |
+| `tkcalendar` | `>=1.6` | `DateEntry` calendar picker widget |
+| `pandas` | `>=1.5` | `read_sql` for pool list; `DataFrame.to_excel` for export |
+| `pyodbc` | `>=4.0` | SQL Server ODBC connection |
+| `requests` | `>=2.28` | HTTP POST to web service endpoint |
+| `python-dotenv` | `>=0.21` | `.env` file loading |
+| `pytz` | `>=2022` | CET timezone localization |
+| `openpyxl` | *(transitive via pandas)* | Excel file writing backend |
+
+All are available on PyPI. Install with:
+
+```bash
+pip install customtkinter tkcalendar pandas pyodbc requests python-dotenv pytz openpyxl
+```
+
+---
+
+## 14. Packaging with PyInstaller
+
+ARM supports packaging as a single Windows `.exe` using PyInstaller. The `resource_path()` helper handles the `sys._MEIPASS` extraction directory automatically.
+
+### Recommended spec file options
+
+```bash
+pyinstaller arm_app.py \
+  --onefile \
+  --windowed \
+  --name ARM \
+  --add-data "sql;sql" \
+  --add-data ".env;." \
+  --hidden-import customtkinter \
+  --hidden-import tkcalendar \
+  --hidden-import pyodbc \
+  --hidden-import pytz
+```
+
+| Flag | Reason |
+|---|---|
+| `--onefile` | Single `.exe` output |
+| `--windowed` | Suppress the console window on Windows |
+| `--add-data "sql;sql"` | Bundle the `sql/` directory (Windows separator is `;`) |
+| `--add-data ".env;."` | Bundle the `.env` file into the root of the extracted temp dir |
+| `--hidden-import` | PyInstaller may not detect these dynamically-used imports |
+
+> **Security note:** Bundling `.env` into the executable embeds credentials. For production, consider shipping the `.env` separately and documenting that it must sit alongside the `.exe`.
+
+---
+
+## 15. Known Limitations & Future Improvements
+
+### Current limitations
+
+| Limitation | Detail |
+|---|---|
+| No concurrent reprocessing | Serials are processed sequentially within a single thread. For large batches, this can be slow. |
+| SSL verification disabled | `verify=False` in all API calls suppresses certificate validation warnings. This is a security risk on untrusted networks. |
+| No session persistence across login | `self.processed` and `self.result_data` are lost when the user logs out and logs back in. |
+| Pool list loaded once at startup | If a new pool is added to the DB after the app opens, it won't appear without restarting. |
+| No progress bar | Large batches provide no visual indication of how many items remain. |
+| `self.processed` / `self.result_data` not locked | Safe in CPython due to the GIL, but not portable to Jython or other runtimes. |
+
+### Suggested improvements
+
+| Improvement | Description |
+|---|---|
+| **Parallel reprocessing** | Use `concurrent.futures.ThreadPoolExecutor` to process multiple serials concurrently, bounded by a configurable worker count |
+| **Re-enable SSL verification** | Pass the correct CA bundle via `verify="/path/to/ca-bundle.crt"` |
+| **Progress bar** | Add a `ttk.Progressbar` that updates per-serial via `self.after()` |
+| **Cancel button** | Add a `threading.Event` stop flag that workers check between serials |
+| **Retry logic** | On API failure (non-200), retry up to N times with exponential backoff before marking as failed |
+| **Persist results** | Save `result_data` to a local SQLite DB so results survive logout/login cycles |
+| **Pool list refresh button** | Add a refresh button next to the Pool dropdown to reload without restarting |
+| **Row colour update** | After a serial is processed successfully, update its Treeview row tag to `"processed"` (green) in real time |
