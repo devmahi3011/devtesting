@@ -1,0 +1,355 @@
+# Automated Reprocess Manager (ARM) — User Manual
+
+**Version:** 1.0  
+**Application:** Automated Reprocess Manager (ARM)  
+**Platform:** Windows Desktop (Python / CustomTkinter)
+
+---
+
+## Table of Contents
+
+1. [Overview](#1-overview)
+2. [System Requirements](#2-system-requirements)
+3. [Configuration](#3-configuration)
+4. [Launching the Application](#4-launching-the-application)
+5. [Login](#5-login)
+6. [Main Interface](#6-main-interface)
+7. [Step-by-Step Workflows](#7-step-by-step-workflows)
+   - 7.1 [Searching for Failed FG Serial Numbers](#71-searching-for-failed-fg-serial-numbers)
+   - 7.2 [Reprocessing Selected Items](#72-reprocessing-selected-items)
+   - 7.3 [Reprocessing All Items](#73-reprocessing-all-items)
+   - 7.4 [Auto-Advance Sync Queue](#74-auto-advance-sync-queue)
+   - 7.5 [Viewing Processed Data](#75-viewing-processed-data)
+   - 7.6 [Exporting to Excel](#76-exporting-to-excel)
+8. [Filter Reference](#8-filter-reference)
+9. [Processing Log Reference](#9-processing-log-reference)
+10. [Error Handling](#10-error-handling)
+11. [Logout](#11-logout)
+12. [Frequently Asked Questions](#12-frequently-asked-questions)
+13. [Glossary](#13-glossary)
+
+---
+
+## 1. Overview
+
+The **Automated Reprocess Manager (ARM)** is a desktop application used by operations teams to identify and reprocess **failed Finished Goods (FG) serial numbers** that did not complete their synchronization workflow. ARM connects to a central SQL database, retrieves failure records, and replays each message through the configured web service endpoint — all without leaving the application.
+
+Key capabilities:
+
+- Filter failures by **Pool**, **Synchronization Queue**, and **date/time range** (CET timezone)
+- View failed FG serial numbers with their failure timestamp and reason
+- Reprocess one, several, or all failed items in a single click
+- Automatically advance to the next Sync Queue when all items in the current queue have been reprocessed
+- View detailed per-item results (order number, API response status)
+- Export results to Excel for reporting
+
+---
+
+## 2. System Requirements
+
+| Requirement | Details |
+|---|---|
+| Operating System | Windows 10 / 11 |
+| Python | 3.10 or later |
+| Database Driver | ODBC Driver (configured via `.env`) |
+| Network | Access to the SQL Server and the web service endpoint |
+| Dependencies | `customtkinter`, `tkcalendar`, `pandas`, `pyodbc`, `requests`, `python-dotenv`, `pytz` |
+
+Install dependencies with:
+
+```bash
+pip install customtkinter tkcalendar pandas pyodbc requests python-dotenv pytz
+```
+
+---
+
+## 3. Configuration
+
+ARM reads all sensitive settings from a `.env` file located in the same directory as the application executable (or the project root when running from source).
+
+### Required `.env` Keys
+
+```env
+# Web service endpoint for reprocessing
+WEB_SERVICES=https://your-service-endpoint/api/run
+
+# Database connection
+DB2_DRIVER=ODBC Driver 17 for SQL Server
+DB2_SERVER=your-server-name
+DB2_DATABASE=your-database-name
+DB2_TRUSTED=yes
+```
+
+> **Important:** The application will refuse to start if `WEB_SERVICES` is not set. Ensure the `.env` file is present before launching.
+
+### SQL Files
+
+ARM expects the following SQL query files inside a `sql/` subdirectory relative to the application:
+
+| File | Purpose |
+|---|---|
+| `sql/PROD_SQ.sql` | Fetches the list of Synchronization Queues for a given pool and date range |
+| `sql/FailedFG.sql` | Retrieves failed FG serial numbers matching the selected filters |
+| `sql/AIOT03_BasedOnFG.sql` | Retrieves the raw messages to replay for a given FG serial number |
+| `sql/FetchOrderBaseOnFG.sql` | Looks up the Order Number associated with an FG serial number |
+
+---
+
+## 4. Launching the Application
+
+**From a packaged executable:**
+
+Double-click `ARM.exe`. Ensure the `.env` file and `sql/` folder are in the same directory.
+
+**From source:**
+
+```bash
+python arm_app.py
+```
+
+The application window opens automatically. If the database connection or `.env` is misconfigured, an error will appear at startup.
+
+---
+
+## 5. Login
+
+If a login screen appears before the main interface, enter your credentials and click **Login**. On success, the main ARM window will open. Clicking **Logout** in the main window returns you to the login screen.
+
+---
+
+## 6. Main Interface
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  From Date  [ yyyy-mm-dd ] [ HH ] : [ MM ] : [ SS ]  (CET)          │
+│  To Date    [ yyyy-mm-dd ] [ HH ] : [ MM ] : [ SS ]  (CET)          │
+│  Pool       [ ▼ Select Pool              ]                           │
+│  Sync Queue [ ▼ Select Down             ]          [ Search ]        │
+├──────────────────────────────────────────┬──────────────────────────┤
+│  FAILED FGSN LIST                        │  ACTIONS                 │
+│  ┌──────────────┬─────────────┬────────┐ │                          │
+│  │ Serial Number│ Fail Date/T │ Reason │ │  [ Reprocess Selected ]  │
+│  │ ...          │ ...         │ ...    │ │  [ Reprocess All       ]  │
+│  └──────────────┴─────────────┴────────┘ │  [ View Data           ]  │
+│                                          │  [ Export Excel        ]  │
+│  PROCESSING LOGS & RESULTS               │                          │
+│  [ log output scrolls here ...         ] │  [ Logout              ]  │
+└──────────────────────────────────────────┴──────────────────────────┘
+```
+
+### Interface Sections
+
+| Section | Description |
+|---|---|
+| **Filter Bar** (top) | Set the date/time range, select a Pool, and select a Sync Queue before searching |
+| **Failed FGSN List** (centre-left) | Table showing failed serial numbers returned by the search |
+| **Processing Logs** (bottom-left) | Real-time log output showing progress and API results |
+| **Actions Panel** (right) | Buttons to trigger reprocessing, view results, export, or logout |
+
+---
+
+## 7. Step-by-Step Workflows
+
+### 7.1 Searching for Failed FG Serial Numbers
+
+1. **Set From Date and Time** — Click the calendar icon on the *From Date* row to pick a date. Use the hour, minute, and second dropdowns to set the start time. All times are interpreted as **CET (Central European Time)**.
+2. **Set To Date and Time** — Repeat for the *To Date* row. The default end time is `23:59:59`.
+3. **Select a Pool** — Click the *Pool* dropdown and choose a pool (values are loaded automatically from the database and are filtered to MI-type pools).
+4. **Select a Synchronization Queue** — Once a Pool is selected, the *Sync Queue* dropdown is populated automatically based on the date range. Choose the queue you want to investigate.
+5. **Click Search** — ARM queries the database in the background. The table populates with all failed FG serial numbers matching your filters. The log will show `Loaded N record(s).` when complete.
+
+> The UI remains fully responsive while the search runs. You can change filters or interact with other controls at any time.
+
+---
+
+### 7.2 Reprocessing Selected Items
+
+Use this when you want to reprocess only specific serial numbers from the list.
+
+1. In the **Failed FGSN List**, click a row to select it. Hold `Ctrl` and click to select multiple rows. Hold `Shift` to select a range.
+2. Click **Reprocess Selected** in the Actions panel.
+3. ARM immediately starts processing in the background. Each serial number is logged in real time:
+   - `Processing: <serial>` — DB query and API call in progress
+   - `<serial> → Success` — the web service accepted the message (HTTP 200/201)
+   - `<serial> → Failed (HTTP NNN)` — the web service returned an error
+   - `<serial> → Request error: ...` — a network or timeout error occurred
+4. When all selected items finish: `Reprocess Selected completed.` is logged.
+
+> Already-processed serials are skipped automatically and logged as `already processed — skipping`.
+
+---
+
+### 7.3 Reprocessing All Items
+
+Use this to reprocess every serial number currently visible in the table.
+
+1. Ensure the table contains the records you want (run a Search first if needed).
+2. Click **Reprocess All** in the Actions panel.
+3. ARM processes every row sequentially in the background, logging each result in real time.
+4. When finished: `Reprocess All completed.` is logged.
+5. If there is a next Sync Queue available for the same pool, ARM will **automatically advance** to it (see [Section 7.4](#74-auto-advance-sync-queue)).
+
+---
+
+### 7.4 Auto-Advance Sync Queue
+
+After **Reprocess All** completes, ARM checks whether there are additional Sync Queues remaining for the current Pool and date range.
+
+**Behaviour:**
+
+- If a **next queue exists**: ARM logs `Auto-advancing: <current> → <next>`, updates the Sync Queue dropdown to the next value, clears the processed-items tracker, and automatically runs a fresh Search for the new queue. No manual action is required.
+- If the current queue was the **last one**: ARM logs `✓ All sync queues for this pool have been processed.` and stops.
+- If the current queue cannot be found in the refreshed list: ARM logs a warning and does not advance.
+
+This allows you to process an entire pool's failure backlog queue-by-queue with minimal manual intervention — simply click **Reprocess All** on each queue as it loads.
+
+---
+
+### 7.5 Viewing Processed Data
+
+After reprocessing, click **View Data** to open a detailed results window.
+
+The **Processed Data View** table shows:
+
+| Column | Description |
+|---|---|
+| Order Number | The order associated with the FG serial number (looked up from the DB) |
+| Status | `Success`, `Failed`, `Error`, or `Not Processed` |
+| Serial Number | The FG serial number |
+| Fail Date | Original failure timestamp |
+| Reason | Original failure reason from the database |
+| Response | The raw API response body returned by the web service |
+
+This window is read-only. Close it when done.
+
+---
+
+### 7.6 Exporting to Excel
+
+1. Click **Export Excel** in the Actions panel.
+2. A **Save As** dialog appears. Choose a location and filename. The default extension is `.xlsx`.
+3. Click **Save**. ARM writes all rows from the current table (including Order Number, Status, and API Response) to the Excel file.
+4. A confirmation dialog: `Excel exported: <path>` confirms success.
+
+> The export includes the same columns as the View Data window. Rows where reprocessing has not been attempted will show `Not Processed` in the Status column.
+
+---
+
+## 8. Filter Reference
+
+### Date / Time Fields
+
+| Control | Default | Description |
+|---|---|---|
+| From Date | Today | Start of the failure search window |
+| From Time | `00:00:00` | Start time (CET) |
+| To Date | Today | End of the failure search window |
+| To Time | `23:59:59` | End time (CET) |
+
+All times are treated as **CET (Europe/Berlin)**. During DST clock-back transitions (ambiguous hours), the post-DST standard time interpretation is used automatically.
+
+### Pool Dropdown
+
+Populated at startup from the `JOB_POOL` table. Only pools whose names contain `MI` are shown. Changing the selected pool immediately refreshes the Sync Queue list.
+
+### Sync Queue Dropdown
+
+Populated dynamically from `PROD_SQ.sql` whenever the Pool, From Date, or To Date changes. Changing time fields (hour, minute, second) also triggers a refresh. Select the specific queue whose failures you want to investigate.
+
+---
+
+## 9. Processing Log Reference
+
+The log panel timestamps every entry. Common messages and their meanings:
+
+| Log Message | Meaning |
+|---|---|
+| `Search started…` | Background search thread has begun |
+| `Loaded N record(s).` | Search completed successfully |
+| `No failed FG Serial Numbers found.` | No failures match the current filters |
+| `Processing: <serial>` | ARM is querying the DB and calling the API for this serial |
+| `<serial> → Success` | API returned HTTP 200 or 201 |
+| `<serial> → Failed (HTTP NNN)` | API returned an unexpected status code |
+| `<serial> → Request error: ...` | Network issue, timeout, or connection refused |
+| `<serial> done — Success: N, Failed: N` | Summary for a serial with multiple messages |
+| `<serial> already processed — skipping` | Serial was already reprocessed in this session |
+| `Reprocess All completed.` | All items finished |
+| `Auto-advancing: A → B` | Moving to next sync queue automatically |
+| `✓ All sync queues for this pool have been processed.` | No more queues to advance to |
+
+---
+
+## 10. Error Handling
+
+| Situation | What happens |
+|---|---|
+| `.env` missing or `WEB_SERVICES` not set | Application refuses to start with an error message |
+| Database connection failure | An error dialog is shown; the log records the exception detail |
+| SQL file not found | The operation fails with a log entry; other operations are unaffected |
+| API call times out (> 30 seconds) | Logged as `Request error: ...`; processing continues with the next serial |
+| API returns non-200 status | Logged as `Failed (HTTP NNN)`; the response body is stored for export |
+| No records found after Search | `No failed FG Serial Numbers found.` is logged; no error dialog |
+| Reprocess clicked with empty table | Warning dialog: `No records to reprocess.` |
+| Reprocess Selected with nothing selected | Warning dialog: `Select at least one Serial Number.` |
+
+All background errors are caught and logged without crashing the application. The UI remains responsive in all cases.
+
+---
+
+## 11. Logout
+
+Click the red **Logout** button at the bottom of the Actions panel. The main window closes and the Login screen reopens. Any unsaved data (results not yet exported) will be lost, so export before logging out if needed.
+
+---
+
+## 12. Frequently Asked Questions
+
+**Q: The Sync Queue dropdown is empty or shows "No Data Found" after I select a pool. What should I check?**
+
+Verify that the selected Pool has records in the Sync Queue table for the chosen date range. Try widening the date range. Also confirm the `sql/PROD_SQ.sql` file is present and the database is reachable.
+
+---
+
+**Q: I clicked Reprocess All but some items show "already processed — skipping". Why?**
+
+ARM tracks which serial numbers have been processed within the current session to prevent duplicate submissions. If you ran Reprocess Selected or Reprocess All earlier in the same session, those serials are remembered. Clicking Search again clears the tracker and allows reprocessing.
+
+---
+
+**Q: The auto-advance did not trigger after Reprocess All. Why?**
+
+Auto-advance only fires after **Reprocess All**, not after Reprocess Selected. It also requires the current Sync Queue value to exist in the refreshed queue list for the pool. If the queue list changed between when you searched and when processing finished, auto-advance will log a warning instead.
+
+---
+
+**Q: The times I enter — are they local time or UTC?**
+
+All times entered in the filter fields are treated as **CET (Central European Time / Europe/Berlin)**. The application does not convert them to UTC. Ensure you enter the times as they appear in the CET production system logs.
+
+---
+
+**Q: Can I run a new Search while reprocessing is still in progress?**
+
+Technically the UI allows it, but it is not recommended. Running a new search will clear the table and the `processed` tracker, which could cause confusion with in-flight reprocess results. Wait for the log to show `Reprocess All completed.` before running a new search.
+
+---
+
+**Q: The View Data window shows blank Order Numbers for some rows. Why?**
+
+The Order Number is fetched via `FetchOrderBaseOnFG.sql`. If a record has no matching order in the database for the given filter parameters, the field will be blank. This does not affect reprocessing results.
+
+---
+
+## 13. Glossary
+
+| Term | Definition |
+|---|---|
+| **FG Serial Number** | Finished Goods serial number — the unique identifier of a manufactured product unit |
+| **Pool** | A named processing pool in the job scheduling system (filtered to MI-type pools in ARM) |
+| **Sync Queue / Synchronization Queue** | A named message queue through which FG data is synchronised to downstream systems |
+| **CET** | Central European Time (Europe/Berlin timezone, UTC+1 in winter, UTC+2 in summer) |
+| **Reprocess** | Re-submitting a previously failed message payload to the web service endpoint for another processing attempt |
+| **Auto-Advance** | The automatic selection of the next Sync Queue after Reprocess All completes on the current queue |
+| **ARM** | Automated Reprocess Manager — this application |
+| **Web Service Endpoint** | The HTTP API (`WEB_SERVICES` in `.env`) that accepts message payloads for processing |
+| **.env** | A plain-text configuration file containing environment variables (credentials, URLs) read at startup |
