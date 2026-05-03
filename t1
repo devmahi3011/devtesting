@@ -1,0 +1,619 @@
+import customtkinter as ctk
+from tkinter import ttk, filedialog, messagebox
+from tkcalendar import DateEntry
+from datetime import datetime
+import pandas as pd
+import pyodbc
+import sys
+import os
+import requests
+import threading
+from dotenv import load_dotenv
+import pytz
+
+# ─── Env / config ───────────────────────────────────────────────────────────
+
+def load_env():
+    base_path = getattr(sys, "_MEIPASS", None) or os.path.abspath(".")
+    env_path = os.path.join(base_path, ".env")
+    load_dotenv(env_path)
+
+load_env()
+AIOT03_DEV = os.getenv("WEB_SERVICES")
+if not AIOT03_DEV:
+    raise ValueError("WEB_SERVICES not set in .env")
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+
+# ─── DB ──────────────────────────────────────────────────────────────────────
+
+def connect_db1():
+    return pyodbc.connect(
+        f"DRIVER={{{os.getenv('DB2_DRIVER')}}};"
+        f"SERVER={os.getenv('DB2_SERVER')};"
+        f"DATABASE={os.getenv('DB2_DATABASE')};"
+        f"Trusted_Connection={os.getenv('DB2_TRUSTED')};"
+    )
+
+
+def resource_path(relative_path):
+    base_path = getattr(sys, "_MEIPASS", None) or os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
+# ─── Data helpers ────────────────────────────────────────────────────────────
+
+def fetch_pool_list():
+    try:
+        conn = connect_db1()
+        df = pd.read_sql("SELECT Name FROM JOB_POOL WHERE Name LIKE '%MI%'", conn)
+        conn.close()
+        return df["Name"].dropna().tolist()
+    except Exception as e:
+        print("fetch_pool_list error:", e)
+        return []
+
+
+def fetch_sync_queue_list(pool, from_dt, to_dt):
+    try:
+        conn = connect_db1()
+        cursor = conn.cursor()
+        with open(resource_path("sql/PROD_SQ.sql"), "r") as f:
+            query = f.read()
+        cursor.execute(query, pool, from_dt, to_dt)
+        rows = cursor.fetchall()
+        conn.close()
+        return [r[0] for r in rows] if rows else ["No Data Found"]
+    except Exception as e:
+        print("fetch_sync_queue_list error:", e)
+        return ["Error Loading"]
+
+
+# ─── DateTimePicker ───────────────────────────────────────────────────────────
+
+class DateTimePicker(ctk.CTkFrame):
+    def __init__(self, master, label, default_time=("00", "00", "00")):
+        super().__init__(master)
+
+        ctk.CTkLabel(self, text=label, width=80).pack(side="left", padx=5)
+
+        self.date = DateEntry(self, width=12, date_pattern="yyyy-mm-dd")
+        self.date.pack(side="left", padx=5)
+
+        self.hour = ctk.CTkComboBox(self, width=60, values=[f"{i:02d}" for i in range(24)])
+        self.hour.set(default_time[0])
+        self.hour.pack(side="left", padx=(10, 2))
+
+        ctk.CTkLabel(self, text=":").pack(side="left")
+
+        self.minute = ctk.CTkComboBox(self, width=60, values=[f"{i:02d}" for i in range(60)])
+        self.minute.set(default_time[1])
+        self.minute.pack(side="left", padx=2)
+
+        ctk.CTkLabel(self, text=":").pack(side="left")
+
+        self.second = ctk.CTkComboBox(self, width=60, values=[f"{i:02d}" for i in range(60)])
+        self.second.set(default_time[2])
+        self.second.pack(side="left", padx=2)
+
+        ctk.CTkLabel(self, text="(CET)", text_color="gray").pack(side="left", padx=10)
+
+    def get_cet_datetime(self):
+        """Return a CET-aware datetime. Uses is_dst=False to handle DST ambiguity safely."""
+        try:
+            dt = datetime.strptime(
+                f"{self.date.get()} {self.hour.get()}:{self.minute.get()}:{self.second.get()}",
+                "%Y-%m-%d %H:%M:%S",
+            )
+            cet = pytz.timezone("Europe/Berlin")
+            # FIX: is_dst=False avoids AmbiguousTimeError during clock-back transitions
+            return cet.localize(dt, is_dst=False)
+        except Exception as e:
+            print("DateTimePicker.get_cet_datetime error:", e)
+            return None
+
+
+# ─── Main App ─────────────────────────────────────────────────────────────────
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Automated Reprocess Manager (ARM)")
+        self.geometry("1100x650")
+
+        self.processed: set = set()
+        self.result_data: dict = {}
+
+        # ── Filter frame ──────────────────────────────────────────────────────
+        filter_frame = ctk.CTkFrame(self)
+        filter_frame.pack(fill="x", padx=10, pady=10)
+
+        self.from_dt = DateTimePicker(filter_frame, "From Date", ("00", "00", "00"))
+        self.from_dt.grid(row=0, column=0, padx=5, pady=5)
+
+        self.to_dt = DateTimePicker(filter_frame, "To Date", ("23", "59", "59"))
+        self.to_dt.grid(row=1, column=0, padx=5, pady=5)
+
+        pool_values = fetch_pool_list()
+        self.pool_var = ctk.StringVar(value="Select Pool")
+        ctk.CTkLabel(filter_frame, text="Pool").grid(row=0, column=1, padx=10)
+        self.pool = ctk.CTkComboBox(
+            filter_frame, variable=self.pool_var, values=pool_values, width=200
+        )
+        self.pool.set("Select Pool")
+        self.pool.grid(row=0, column=2, padx=5)
+
+        ctk.CTkLabel(filter_frame, text="Synchronization Queue").grid(row=1, column=1, padx=10)
+        self.sync_var = ctk.StringVar(value="Select Down")
+        self.sync = ctk.CTkComboBox(
+            filter_frame, variable=self.sync_var, values=["Select Down"], width=200
+        )
+        self.sync.set("Select Down")
+        self.sync.grid(row=1, column=2, padx=5)
+
+        # FIX: button now calls the threaded version
+        ctk.CTkButton(filter_frame, text="Search", command=self._thread_search).grid(
+            row=0, column=3, rowspan=2, padx=15
+        )
+
+        # ── Main frame ────────────────────────────────────────────────────────
+        main_frame = ctk.CTkFrame(self)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # Table
+        table_frame = ctk.CTkFrame(main_frame)
+        table_frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+
+        ctk.CTkLabel(table_frame, text="FAILED FGSN LIST").pack(anchor="w", padx=10, pady=5)
+
+        columns = ("Serial Number", "Fail Date/Time", "Reason")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, anchor="center")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.tree.tag_configure("processed", background="#d1ffd6")
+        self.tree.tag_configure("skipped", background="#f0f0f0")
+
+        # Logs
+        log_frame = ctk.CTkFrame(table_frame)
+        log_frame.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(log_frame, text="PROCESSING LOGS & RESULTS").pack(anchor="w")
+        self.log_text = ctk.CTkTextbox(log_frame, height=120)
+        self.log_text.pack(fill="x", pady=5)
+
+        # Actions
+        action_frame = ctk.CTkFrame(main_frame, width=200)
+        action_frame.pack(side="right", fill="y", padx=5, pady=5)
+
+        ctk.CTkLabel(action_frame, text="ACTIONS").pack(pady=10)
+
+        # FIX: all action buttons call threaded wrappers
+        ctk.CTkButton(
+            action_frame, text="Reprocess Selected", command=self._thread_reprocess_selected
+        ).pack(pady=5)
+        ctk.CTkButton(
+            action_frame, text="Reprocess All", command=self._thread_reprocess_all
+        ).pack(pady=5)
+        ctk.CTkButton(action_frame, text="View Data", command=self.view_data).pack()
+        ctk.CTkButton(action_frame, text="Export Excel", command=self.export_excel).pack(pady=5)
+        ctk.CTkButton(
+            action_frame,
+            text="Logout",
+            fg_color="red",
+            hover_color="#cc0000",
+            command=self.logout,
+        ).pack(pady=20)
+
+        # ── Sync queue auto-refresh ───────────────────────────────────────────
+        def refresh_sync_queue(*_):
+            pool = self.pool_var.get()
+            if pool in ("", "Select Pool", None):
+                self.sync.configure(values=["Select Down"])
+                self.sync.set("Select Down")
+                return
+            f_dt = self.from_dt.get_cet_datetime()
+            t_dt = self.to_dt.get_cet_datetime()
+            values = fetch_sync_queue_list(pool, f_dt, t_dt)
+            self.sync.configure(values=values)
+            if values:
+                self.sync.set(values[0])
+
+        self.pool_var.trace_add("write", refresh_sync_queue)
+        self.from_dt.date.bind("<<DateEntrySelected>>", refresh_sync_queue)
+        self.to_dt.date.bind("<<DateEntrySelected>>", refresh_sync_queue)
+
+        # FIX: also refresh when hour/minute/second change
+        for picker in (self.from_dt, self.to_dt):
+            picker.hour.configure(command=lambda _v: refresh_sync_queue())
+            picker.minute.configure(command=lambda _v: refresh_sync_queue())
+            picker.second.configure(command=lambda _v: refresh_sync_queue())
+
+    # ─── Thread launchers ────────────────────────────────────────────────────
+    # Rule: ZERO Tkinter widget reads inside background threads.
+    # Every value that the worker needs is read HERE on the main thread and
+    # passed as a plain Python value.  The worker never touches self.pool_var,
+    # self.sync_var, self.from_dt, self.to_dt, or self.tree directly.
+
+    def _snapshot_filter(self) -> dict:
+        """Read all filter widgets NOW (main thread) and return plain values."""
+        return {
+            "pool":       self.pool_var.get(),
+            "sync_queue": self.sync_var.get(),
+            "sync_pat":   f"%{self.sync_var.get()}%",
+            "from_dt":    self.from_dt.get_cet_datetime(),
+            "to_dt":      self.to_dt.get_cet_datetime(),
+        }
+
+    def _thread_search(self):
+        f = self._snapshot_filter()
+        threading.Thread(target=self._search, args=(f,), daemon=True).start()
+
+    def _thread_reprocess_selected(self):
+        selected_items = self.tree.selection()
+        if not selected_items:
+            messagebox.showwarning("Warning", "Select at least one Serial Number.")
+            return
+        # Snapshot tree rows AND filter on the main thread
+        serials = [self.tree.item(i, "values")[0] for i in selected_items]
+        f = self._snapshot_filter()
+        threading.Thread(
+            target=self._reprocess_worker, args=(serials, f, False), daemon=True
+        ).start()
+
+    def _thread_reprocess_all(self):
+        serials = [self.tree.item(i, "values")[0] for i in self.tree.get_children()]
+        if not serials:
+            messagebox.showwarning("Warning", "No records to reprocess.")
+            return
+        f = self._snapshot_filter()
+        threading.Thread(
+            target=self._reprocess_worker, args=(serials, f, True), daemon=True
+        ).start()
+
+    # ─── Thread-safe UI helpers ──────────────────────────────────────────────
+
+    def log(self, message: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {message}\n"
+        self.after(0, lambda: (self.log_text.insert("end", line), self.log_text.see("end")))
+
+    def _show_error(self, title: str, msg: str):
+        self.after(0, lambda: messagebox.showerror(title, msg))
+
+    def _show_warning(self, title: str, msg: str):
+        self.after(0, lambda: messagebox.showwarning(title, msg))
+
+    def _clear_log(self):
+        self.after(0, lambda: self.log_text.delete("1.0", "end"))
+
+    def _clear_tree(self):
+        self.after(0, lambda: [self.tree.delete(i) for i in self.tree.get_children()])
+
+    def _insert_tree_row(self, values: tuple):
+        self.after(0, lambda v=values: self.tree.insert("", "end", values=v))
+
+    # ─── Search ──────────────────────────────────────────────────────────────
+
+    def _search(self, f: dict):
+        """Background thread. f = pre-snapshotted filter dict."""
+        self._clear_log()
+        self.log("Search started…")
+        self._clear_tree()
+        self.processed.clear()
+
+        conn = cursor = None
+        try:
+            conn = connect_db1()
+            cursor = conn.cursor()
+
+            with open(resource_path("sql/FailedFG.sql"), "r") as fh:
+                query = fh.read()
+
+            cursor.execute(query, (f["pool"], f["sync_pat"], f["from_dt"], f["to_dt"]))
+            rows = cursor.fetchall()
+
+            if not rows:
+                self.log("No failed FG Serial Numbers found.")
+                return
+
+            for row in rows:
+                serial  = row.fgserialnumber if hasattr(row, "fgserialnumber") else row[0]
+                fail_dt = row.FinishedOn     if hasattr(row, "FinishedOn")     else row[1]
+                reason  = row.Info           if hasattr(row, "Info")           else row[2]
+                if fail_dt:
+                    fail_dt = fail_dt.strftime("%Y-%m-%d %H:%M:%S")
+                self._insert_tree_row((serial, fail_dt, reason))
+
+            self.log(f"Loaded {len(rows)} record(s).")
+
+        except Exception as e:
+            self.log(f"Error: {e}")
+            self._show_error("Search Error", str(e))
+        finally:
+            if cursor: cursor.close()
+            if conn:   conn.close()
+
+    # ─── Process single FG (pure worker — no Tkinter reads) ──────────────────
+
+    def _process_fg(self, fgserialnumber: str, f: dict, cursor, session: requests.Session):
+        """
+        Background thread only.  All filter values come from f (plain dict) —
+        no Tkinter widgets are touched here.
+        """
+        if not fgserialnumber:
+            self.log("Invalid Serial Number — skipping.")
+            return
+
+        self.log(f"Processing: {fgserialnumber}")
+
+        try:
+            with open(resource_path("sql/AIOT03_BasedOnFG.sql"), "r", encoding="utf-8") as fh:
+                query = fh.read()
+
+            cursor.execute(
+                query,
+                f["pool"], f["sync_pat"], f["from_dt"], f["to_dt"], fgserialnumber
+            )
+            rows = cursor.fetchall()
+
+            if not rows:
+                self.log(f"No data found for {fgserialnumber}")
+                return
+
+            success_count = fail_count = 0
+
+            for row in rows:
+                msg = row[0]
+                payload = {
+                    "Inputs": {"IncomingMessage": msg},
+                    "ExecutionMode": 1,
+                    "Retries": 1,
+                    "SleepTime": 100,
+                    "SynchronousQueue": "",
+                    "Timeout": 100,
+                }
+                try:
+                    response = session.post(AIOT03_DEV, json=payload, verify=False, timeout=30)
+                    try:
+                        resp_json = response.json()
+                    except Exception:
+                        resp_json = response.text
+
+                    if response.status_code in (200, 201):
+                        success_count += 1
+                        self.log(f"{fgserialnumber} → Success")
+                        self.result_data[fgserialnumber] = {"status": "Success", "response": str(resp_json)}
+                    else:
+                        fail_count += 1
+                        self.log(f"{fgserialnumber} → Failed (HTTP {response.status_code})")
+                        self.result_data[fgserialnumber] = {
+                            "status": "Failed",
+                            "response": f"HTTP {response.status_code} | {resp_json}",
+                        }
+                except Exception as req_err:
+                    fail_count += 1
+                    self.log(f"{fgserialnumber} → Request error: {req_err}")
+                    self.result_data[fgserialnumber] = {"status": "Error", "response": str(req_err)}
+
+            self.log(f"{fgserialnumber} done — Success: {success_count}, Failed: {fail_count}")
+
+        except Exception as e:
+            self.log(f"Error processing {fgserialnumber}: {e}")
+
+    # ─── Unified reprocess worker ─────────────────────────────────────────────
+
+    def _reprocess_worker(self, serials: list, f: dict, advance_queue: bool):
+        """
+        Background thread.
+
+        serials        — pre-snapshotted serial numbers.
+        f              — pre-snapshotted filter dict (no Tkinter reads needed).
+        advance_queue  — if True (Reprocess All), auto-advance to the next sync
+                         queue once all items are done, then trigger a new search.
+        """
+        self._clear_log()
+        conn = cursor = session = None
+        try:
+            conn = connect_db1()
+            cursor = conn.cursor()
+            session = requests.Session()
+
+            processed_any = False
+            for serial in serials:
+                if serial in self.processed:
+                    self.log(f"{serial} already processed — skipping")
+                    continue
+                self.processed.add(serial)
+                processed_any = True
+                self._process_fg(serial, f, cursor, session)
+
+            label = "Reprocess All" if advance_queue else "Reprocess Selected"
+            self.log(f"{label} completed." if processed_any else "All items already processed.")
+
+            # ── Auto-advance sync queue ───────────────────────────────────────
+            if advance_queue:
+                self._maybe_advance_sync_queue(f)
+
+        except Exception as e:
+            self.log(f"Error: {e}")
+            self._show_error("Error", str(e))
+        finally:
+            if session: session.close()
+            if cursor:  cursor.close()
+            if conn:    conn.close()
+
+    # ─── Auto-advance sync queue (background thread, no Tkinter reads) ────────
+
+    def _maybe_advance_sync_queue(self, f: dict):
+        """
+        Called from the background thread after Reprocess All finishes.
+
+        Uses f["pool"], f["from_dt"], f["to_dt"], f["sync_queue"] — all plain
+        Python values captured before the thread started — so no Tkinter widget
+        is touched here.
+
+        If a next queue exists:
+          • updates the sync ComboBox (via self.after → main thread)
+          • clears self.processed
+          • kicks off a fresh search automatically
+        """
+        try:
+            queue_list = fetch_sync_queue_list(f["pool"], f["from_dt"], f["to_dt"])
+
+            valid = [
+                q for q in queue_list
+                if q not in ("No Data Found", "Error Loading", "Select Down", "")
+            ]
+
+            if not valid:
+                self.log("No sync queues found for this pool / date range.")
+                return
+
+            current = f["sync_queue"]
+            try:
+                idx = valid.index(current)
+            except ValueError:
+                self.log(f"Queue '{current}' not in list — cannot auto-advance.")
+                return
+
+            if idx + 1 >= len(valid):
+                self.log("✓ All sync queues for this pool have been processed.")
+                return
+
+            next_q = valid[idx + 1]
+            self.log(f"Auto-advancing: {current} → {next_q}")
+
+            # Build next filter snapshot (all plain values — safe from any thread)
+            next_f = {**f, "sync_queue": next_q, "sync_pat": f"%{next_q}%"}
+
+            def _advance_on_main():
+                # Only these two lines touch Tkinter widgets
+                self.sync.configure(values=valid)
+                self.sync_var.set(next_q)
+                self.processed.clear()
+                # Launch the next search with the updated filter snapshot
+                threading.Thread(target=self._search, args=(next_f,), daemon=True).start()
+
+            self.after(0, _advance_on_main)
+
+        except Exception as e:
+            self.log(f"Auto-advance error: {e}")
+
+    # ─── Order number helper ──────────────────────────────────────────────────
+
+    def _get_order_number(self, cursor, serial: str, f: dict) -> str:
+        """f = filter snapshot dict — no Tkinter reads here."""
+        try:
+            with open(resource_path("sql/FetchOrderBaseOnFG.sql"), "r") as fh:
+                query = fh.read()
+            cursor.execute(query, f["pool"], f["sync_pat"], f["from_dt"], f["to_dt"], serial)
+            row = cursor.fetchone()
+            return row[0] if row else ""
+        except Exception as e:
+            self.log(f"Order fetch error for {serial}: {e}")
+            return ""
+
+    # ─── View data ────────────────────────────────────────────────────────────
+
+    def view_data(self):
+        # Snapshot filter on the main thread before opening the window
+        f = self._snapshot_filter()
+
+        view_win = ctk.CTkToplevel(self)
+        view_win.title("Processed Data View")
+        view_win.geometry("1000x450")
+
+        columns = ("Order Number", "Status", "Serial Number", "Fail Date", "Reason", "Response")
+        tree = ttk.Treeview(view_win, columns=columns, show="headings")
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, anchor="center", width=150)
+        tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Snapshot tree rows on the main thread
+        rows_snapshot = [
+            self.tree.item(i, "values") for i in self.tree.get_children()
+        ]
+
+        conn = cursor = None
+        try:
+            conn = connect_db1()
+            cursor = conn.cursor()
+
+            for values in rows_snapshot:
+                serial, fail_dt, reason = values[0], values[1], values[2]
+                order_no = self._get_order_number(cursor, serial, f)
+                result = self.result_data.get(serial, {})
+                tree.insert("", "end", values=(
+                    order_no,
+                    result.get("status", "Not Processed"),
+                    serial, fail_dt, reason,
+                    result.get("response", ""),
+                ))
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+        finally:
+            if cursor: cursor.close()
+            if conn:   conn.close()
+
+    # ─── Export Excel ─────────────────────────────────────────────────────────
+
+    def export_excel(self):
+        file = filedialog.asksaveasfilename(defaultextension=".xlsx")
+        if not file:
+            return
+
+        # Snapshot both filter and tree rows on the main thread
+        f = self._snapshot_filter()
+        rows_snapshot = [
+            self.tree.item(i, "values") for i in self.tree.get_children()
+        ]
+
+        conn = cursor = None
+        try:
+            conn = connect_db1()
+            cursor = conn.cursor()
+            export_data = []
+
+            for values in rows_snapshot:
+                serial, fail_dt, reason = values[0], values[1], values[2]
+                order_no = self._get_order_number(cursor, serial, f)
+                result = self.result_data.get(serial, {})
+                export_data.append({
+                    "Order Number": order_no,
+                    "Status": result.get("status", "Not Processed"),
+                    "Serial Number": serial,
+                    "Fail Date": fail_dt,
+                    "Reason": reason,
+                    "Response": result.get("response", ""),
+                })
+
+            if not export_data:
+                messagebox.showwarning("Warning", "No data to export.")
+                return
+
+            pd.DataFrame(export_data).to_excel(file, index=False)
+            messagebox.showinfo("Success", f"Excel exported:\n{file}")
+
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+        finally:
+            if cursor: cursor.close()
+            if conn:   conn.close()
+
+    # ─── Logout ───────────────────────────────────────────────────────────────
+
+    def logout(self):
+        self.destroy()
+        from login import LoginApp
+        LoginApp().mainloop()
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
